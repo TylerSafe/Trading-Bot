@@ -1,35 +1,55 @@
-class SmoothApricotFox(QCAlgorithm):
+class DeterminedYellowMonkey(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2020, 1, 1)  # Set Start Date
-        self.SetEndDate(2021, 1, 1)
+        self.SetStartDate(2022, 4, 4)
         self.SetCash(100000)  # Set Strategy Cash
         
-        spy = self.AddEquity("SPY", Resolution.Daily) # get data in Minute time frame (tick is lowest)
+        self.gme = self.AddEquity("GME", Resolution.Minute).Symbol
         
-        spy.SetDataNormalizationMode(DataNormalizationMode.Raw)
-        
-        self.spy = spy.Symbol # remove ambiguity when referring to SPY
-        
-        self.SetBenchmark("SPY") # compare performance against the SPY
-        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin) # set to fee structure of IBKR
-        
-        self.entryPrice = 0
-        self.period = timedelta(31) # only invest every 31 days
-        self.nextEntryTime = self.Time
-        
+        self.entryTicket = None
+        self.stopMarketTicket = None
+        self.entryTime = datetime.min
+        self.stopMarketOrderFillTime = datetime.min
+        self.highestPrice = 0
 
-    def OnData(self, data):
+
+    def OnData(self, data: Slice):
+        if (self.Time - self.stopMarketOrderFillTime).days < 30: # wait 30 days after trade to buy again
+            return
         
-        price = data[self.spy].Close # get closing price of spy yesterday
+        price = self.Securities[self.gme].Price
         
-        if not self.Portfolio.Invested: # make sure we aren't already invested in the spy
-            if self.nextEntryTime <= self.Time: # we are only investing every 31 days
-                self.SetHoldings(self.spy, 1)
-                # self.MarketOrder(self.spy, int(self.Portfolio.Cash / price))
-                self.Log("Buy SPY @" + str(price)) # add data to log
-                self.entryPrice = price
-        elif self.entryPrice * 1.1 < price or self.entryPrice * 0.95 > price:
-            self.Liquidate(self.spy) # liquidate all positions in spy
-            self.Log("Sell SPY @" + str(price))
-            self.nextEntryTime = self.Time + self.period # start timer until we can invest again
+        # send limit order if stock not owned and no other orders are waiting
+        if not self.Portfolio.Invested and not self.Transactions.GetOpenOrders(self.gme):
+            quantity = self.CalculateOrderQuantity(self.gme, 0.9) # allocates 90% of portfolio to stock
+            self.entryTicket = self.LimitOrder(self.gme, quantity, price, "Entry Order") # place limit order
+            self.entryTime = self.Time
+            
+        # move price if not filled after 1 day
+        if (self.Time - self.entryTime).days > 1 and self.entryTicket.Status != OrderStatus.Filled:
+            self.entryTime = self.Time
+            updateFields = UpdateOrderFields()
+            updateFields.LimitPrice = price
+            self.entryTicket.Update(updateFields)
+            
+        # move up trailing stop loss
+        if self.stopMarketTicket is not None and self.Portfolio.Invested:
+            if price > self.highestPrice:
+                self.highestPrice = price
+                updateFields = UpdateOrderFields()
+                updateFields.StopPrice = price * 0.95
+                self.stopMarketTicket.Update(updateFields)
+        
+    def OnOrderEvent(self, orderEvent):
+        if orderEvent.Status != OrderStatus.Filled:
+            return
+        
+        # send stop loss order if entry limit order is filled
+        if self.entryTicket is not None and self.entryTicket.OrderId == orderEvent.OrderId:
+            self.stopMarketTicket = self.StopMarketOrder(self.gme, -self.entryTicket.Quantity, 0.95 * self.entryTicket.AverageFillPrice)
+            
+        # save fill time of stop loss order
+        if self.stopMarketTicket is not None and self.stopMarketTicket.OrderId == orderEvent.OrderId:
+            self.stopMarketORderFillTime = self.Time
+            self.highestPrice = 0
