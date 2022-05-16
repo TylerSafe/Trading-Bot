@@ -1,29 +1,53 @@
-# - changed 4% at some point within the last 1.5 hours (high and low could be at any point within the last 1.5 hours)
-# - Draw a line at 50% fibonacchi retracement (half way between low and high)
-# - Draw a line at 61.8% fibonacchi retracement
-# - Test using options, buying ATM calls/puts with expiries 7 - 14 days, taking profit at 5, 10, 15, 20, 25 and 50% profit
-# - test 1: If price retraces to this band at some point during the day and touches vwap buy (vwap acts as support/resistance)
-# - test 2: If price retraces to this band at some point during the day and is above/below vwap depending then buy
-# - test 3: If price retraces to 50% fib at some point during the day buy, buy double if supported by vwap
-# - also test selling once price returns back to vwap or at least setting the stop at vwap once it reaches
-# - trailing stop 5%, 6%.... 10%
-# - only buy once 
-# - don't buy within last 2 hours of day
-# - sell at eod (don't carry positions over night)
-# - after a trade is made time out for 90 mins
+# Video link:
+# https://www.youtube.com/watch?v=d3j2zYXKSUs&ab_channel=TradeOptionsWithMe
+# https://www.quantconnect.com/forum/discussion/13125/options-trade-with-stop-loss-and-profit-taking/p1
 
-class CreativeBrownViper(QCAlgorithm):
+class WellDressedAsparagusKoala(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2020, 1, 1)  # Set Start Date
-        self.SetEndDate(2021, 1, 1) # Set End Date
+        self.SetStartDate(2021, 1, 1)  # Set Start Date
         self.SetCash(100000)  # Set Strategy Cash
-        self.amd = self.AddEquity("amd", Resolution.Minute).Symbol
-        self.goog = self.AddEquity("goog", Resolution.Minute).Symbol
-        self.AMD_VWAP = self.VWAP("AMD", 90)
-        self.GOOG_VWAP = self.VWAP("GOOG", 90)
+        equity = self.AddEquity("AMD", Resolution.Minute) 
+        equity.SetDataNormalizationMode(DataNormalizationMode.Raw) # options only support raw data
+        self.equity = equity.Symbol
+        self.SetBenchmark(self.equity) # set stock as the benchmark
         
+        option = self.AddOption("AMD", Resolution.Minute)
+        option.SetFilter(-2, 2, timedelta(7), timedelta(14)) # get options contracts within 2 strikes that expire between 7 and 14 days from today
+        
+        self.high = self.MAX(self.equity, 21, Resolution.Daily, Field.High) # highest price over the last month
+
+    
     def OnData(self, data: Slice):
-        self.History([self.Symbol("AMD"), self.Symbol("GOOG")], 90, Resolution.Minute) # get the price each minute of the last 90 minutes
+        if not self.high.IsReady: # if high indicator is not ready to use return until it is
+            return
+
+        option_invested = [x.Key for x in self.Portfolio if x.Value.Invested and x.Value.Type == SecurityType.Option] # check if already invested
         
+        if option_invested:
+            if self.Time + timedelta(4) > option_invested[0].ID.Date: # if there are 4 days left to expiration sell contract
+                self.Liquidate(option_invested[0], "Too close to expiration")
+            return
         
+        if self.Securities[self.equity].Price >= self.high.Current.Value: # if the price has reached the highest of last month
+            for i in data.OptionChains:
+                chains = i.Value
+                self.BuyCall(chains)
+                
+    def BuyCall(self, chains):
+        expiry = sorted(chains, key = lambda x: x.Expiry, reverse = True)[0].Expiry # get the furthest expiration date (greater than 7, less than 14)
+        calls = [i for i in chains if i.Expiry == expiry and i.Right == OptionRight.Call] # filter out only call options
+        call_contracts = sorted(calls, key = lambda x: abs(x.Strike - x.UnderlyingLastPrice)) # sort contracts by closest to the money
+        
+        if len(call_contracts) == 0:
+            return
+        self.call = call_contracts[0] # contract with closest strike to current price (ATM)
+        
+        quantity = self.Portfolio.TotalPortfolioValue / self.call.AskPrice 
+        quantity = int(0.05 * quantity / 100) # invest 5% of portfolio in option
+        self.Buy(self.call.Symbol, quantity) # buy the contract
+        
+    def OnOrderEvent(self, orderEvent): # handle options being assigned
+        order = self.Transactions.GetOrderById(orderEvent.OrderId)
+        if order.Type == OrderType.OptionExercise:
+            self.Liquidate()
