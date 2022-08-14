@@ -1,72 +1,111 @@
-# Video link:
-# https://www.youtube.com/watch?v=d3j2zYXKSUs&ab_channel=TradeOptionsWithMe
-# https://www.quantconnect.com/forum/discussion/13125/options-trade-with-stop-loss-and-profit-taking/p1
+# region imports
+from AlgorithmImports import *
+# endregion
 
-class WellDressedAsparagusKoala(QCAlgorithm):
+class FormalYellowGreenCaterpillar(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2021, 1, 1)  # Set Start Date
+        self.SetStartDate(2022, 1, 1)  # Set Start Date
         self.SetCash(100000)  # Set Strategy Cash
-        equity = self.AddEquity("AMD", Resolution.Minute) 
-        equity.SetDataNormalizationMode(DataNormalizationMode.Raw) # options only support raw data
-        self.equity = equity.Symbol
-        self.SetBenchmark(self.equity) # set stock as the benchmark
-        self.vwap = self.VWAP(self.equity, 390)
         
-        option = self.AddOption("AMD", Resolution.Minute)
-        option.SetFilter(-2, 2, timedelta(7), timedelta(14)) # get options contracts within 2 strikes that expire between 7 and 14 days from today
-        
-        self.high = self.MAX(self.equity, 120) # highest price in last 120 mins
-        self.low = self.MIN(self.equity, 120) # lowest price in last 120 mins
-        
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(16, 00, 00), Action(self.Resetting)) # at the end of the day reset vwap data
+        self.watch_list = ["SPY", "GOOGL", "AAPL", "AMZN"]
+        PORTFOLIO = len(self.watch_list)
+        self.symbols = []
+        self.stocks = []
+        self.current_price = [0] * PORTFOLIO # save the current price to compare to previous price to check movement
+        self.previous_price = [0] * PORTFOLIO
+        self.percent_change = [0] * PORTFOLIO
 
-    
+        for i in range(len(self.watch_list)):
+            option = self.AddOption(self.watch_list[i])
+            self.symbols.append(option.Symbol)
+            option.SetFilter(-2, 2, timedelta(0), timedelta(8)) # get options contracts within 2 strikes that expire between 0 and 8 days from today
+
+            stock = self.AddEquity(self.watch_list[i], Resolution.Minute).Symbol # also store stock information for price tracking
+            self.stocks.append(stock)
+
+        self.Schedule.On(self.DateRules.EveryDay(self.symbols[0]), self.TimeRules.BeforeMarketClose(self.symbols[0], 10), self.ExitPositions) # exit all positions 10 mins before close
+
+
     def OnData(self, data: Slice):
-        if not self.high.IsReady or not self.low.IsReady: # if high or low indicator is not ready to use return until it is
+        if self.Time > self.Time.replace(hour=15, minute=50) or self.Time < self.Time.replace(hour=9, minute=35): # don't trade in the last 10 mins or first 5 of the day
             return
 
-        option_invested = [x.Key for x in self.Portfolio if x.Value.Invested and x.Value.Type == SecurityType.Option] # check if already invested
+        option_invested = [x.Key for x in self.Portfolio if x.Value.Invested and x.Value.Type==SecurityType.Option]
+
+        for i in range(len(self.stocks)):
+            self.current_price[i] = data[self.watch_list[i]].Price # save current price of each stock
+
+            if self.previous_price[i] != 0: # ensure it isn't the first minute where no data is available
+                change = self.current_price[i] - self.previous_price[i] # calculate change in price over last minute
+                self.percent_change[i] = change / self.previous_price[i] # calculate the percentage change (+ or -)
         
-        #if option_invested:
-        #    if self.Time + timedelta(4) > option_invested[0].ID.Date: # if there are 4 days left to expiration sell contract
-        #        self.Liquidate(option_invested[0], "Too close to expiration")
-        #    return
+                if i != 0: # ensure SPY has its data
+                    difference = abs(self.percent_change[0] - self.percent_change[i])
+
+                    if difference > 0.005 and self.percent_change[i] > self.percent_change[0] and self.percent_change[i] > 0: # adjust this number, difference between SPY change and watchlist stock, currently 0.5%
+                        for kvp in data.OptionChains: # initiate sequence to buy an ATM call
+                            if kvp.Key == self.symbols[i]:
+                                chains = kvp.Value
+                                self.BuyCall(chains)
+
+                    if difference > 0.005 and self.percent_change[i] < self.percent_change[0] and self.percent_change[i] < 0: # adjust this number, difference between SPY change and watchlist stock, currently 0.5%
+                        for kvp in data.OptionChains: # initiate sequence to buy an ATM put
+                            if kvp.Key == self.symbols[i]:
+                                chains = kvp.Value
+                                self.BuyPut(chains)
         
-        #if self.Securities[self.equity].Price >= self.high.Current.Value: # if the price has reached the highest of last month
-        #    for i in data.OptionChains:
-        #        chains = i.Value
-        #        self.BuyCall(chains)
-                
-        CurrentPrice = self.Securities[self.equity].Price # get the current price of stock
-        
-        if CurrentPrice == self.vwap.Current.Value: # if the price has reached the highest of last month
-            for i in data.OptionChains:
-                chains = i.Value
-                self.BuyCall(chains)
-        
-        if option_invested:        
-            if CurrentPrice >= self.BuyIn * 1.02 or CurrentPrice <= self.BuyIn * 0.99: # if stock price decreases by 1% or increases by 2% sell contract
-                self.Liquidate() # need to make it specific to the contract in question or ticker
-                
-    def BuyCall(self, chains):
-        expiry = sorted(chains, key = lambda x: x.Expiry, reverse = True)[0].Expiry # get the furthest expiration date (greater than 7, less than 14)
+        for i in range(len(self.stocks)):
+            self.previous_price[i] = self.current_price[i] # record price for next comparison
+
+    def BuyCall(self, chains): # buy an ATM call (market order need to change to limit)
+        expiry = sorted(chains, key = lambda x: x.Expiry)[0].Expiry # get the closest expiration date
         calls = [i for i in chains if i.Expiry == expiry and i.Right == OptionRight.Call] # filter out only call options
         call_contracts = sorted(calls, key = lambda x: abs(x.Strike - x.UnderlyingLastPrice)) # sort contracts by closest to the money
         
         if len(call_contracts) == 0:
             return
-        self.call = call_contracts[0] # contract with closest strike to current price (ATM)
         
+        self.call = call_contracts[0] # contract with closest strike to current price (ATM)
         quantity = self.Portfolio.TotalPortfolioValue / self.call.AskPrice 
         quantity = int(0.05 * quantity / 100) # invest 5% of portfolio in option
-        self.Buy(self.call.Symbol, quantity) # buy the contract
-        self.BuyIn = CurrentPrice # set record of price the of the stock when the contract was purchased (need to work out option price)
         
-    def OnOrderEvent(self, orderEvent): # handle options being assigned
+        self.Buy(self.call.Symbol, quantity) # buy the contract
+        self.LimitOrder(self.call.Symbol, -quantity, (self.call.AskPrice * 1.1)) # take profit at 10%
+        self.StopMarketOrder(self.call.Symbol, -quantity, (self.call.AskPrice * 0.95)) # cut losses at 5%
+
+    def BuyPut(self, chains): # buy an ATM put (market order need to change to limit)
+        expiry = sorted(chains, key = lambda x: x.Expiry)[0].Expiry # get the closest expiration date
+        puts = [i for i in chains if i.Expiry == expiry and i.Right == OptionRight.Put] # filter out only put options
+        put_contracts = sorted(puts, key = lambda x: abs(x.Strike - x.UnderlyingLastPrice)) # sort contracts by closest to the money
+        
+        if len(put_contracts) == 0:
+            return
+        
+        self.put = put_contracts[0] # contract with closest strike to current price (ATM)
+        quantity = self.Portfolio.TotalPortfolioValue / self.put.AskPrice 
+        quantity = int(0.05 * quantity / 100) # invest 5% of portfolio in option
+    
+        self.Buy(self.put.Symbol, quantity) # buy the contract
+        self.LimitOrder(self.put.Symbol, -quantity, (self.put.AskPrice * 1.1)) # take profit at 10%
+        self.StopMarketOrder(self.put.Symbol, -quantity, (self.put.AskPrice * 0.95)) # cut losses at 5%
+
+    def OnOrderEvent(self, orderEvent):
         order = self.Transactions.GetOrderById(orderEvent.OrderId)
+        # Cancel remaining order if limit order or stop loss order is executed
+        if order.Status == OrderStatus.Filled:
+            if order.Type == OrderType.Limit or OrderType.StopMarket:
+                self.Transactions.CancelOpenOrders(order.Symbol)
+                
+            if order.Status == OrderStatus.Canceled:
+                self.Log(str(orderEvent))
+        
+        # Liquidate before options are exercised
         if order.Type == OrderType.OptionExercise:
             self.Liquidate()
-            
-    def Resetting(self):
-        self.vwap.Reset()
+
+    def ExitPositions(self):
+        self.Liquidate() # exit all positions
+        for i in range(len(self.stocks)):
+            self.previous_price[i] = 0
+            self.current_price[i] = 0
